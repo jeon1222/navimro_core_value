@@ -11,6 +11,12 @@ const ADMIN_KEY = process.env.ADMIN_KEY || 'change-me-before-deploy';
 const ROOT = __dirname;
 const DATABASE_URL = String(process.env.DATABASE_URL || '').trim();
 const USE_POSTGRES = !!DATABASE_URL;
+const IS_PRODUCTION = String(process.env.NODE_ENV || '').toLowerCase() === 'production';
+const EMPLOYEE_ID_HMAC_SECRET = String(process.env.EMPLOYEE_ID_HMAC_SECRET || '').trim();
+if (IS_PRODUCTION && EMPLOYEE_ID_HMAC_SECRET.length < 32) {
+  throw new Error('EMPLOYEE_ID_HMAC_SECRET 환경변수는 운영환경에서 32자 이상으로 설정해야 합니다.');
+}
+const HMAC_SECRET = EMPLOYEE_ID_HMAC_SECRET || 'local-dev-only-change-this-secret';
 
 const DATA_DIR = process.env.DATA_DIR || path.join(ROOT, 'data');
 const PARTICIPANTS_FILE = path.join(DATA_DIR, 'participants.json');
@@ -39,14 +45,16 @@ function writeJson(f,d){const t=f+'.tmp';fs.writeFileSync(t,JSON.stringify(d,nul
 function send(res,status,obj,headers={}){const body=Buffer.from(typeof obj==='string'?obj:JSON.stringify(obj));res.writeHead(status,{'Content-Type':typeof obj==='string'?'text/plain; charset=utf-8':'application/json; charset=utf-8','Content-Length':body.length,'Cache-Control':'no-store',...headers});res.end(body)}
 function clean(v,max=100){return String(v??'').trim().slice(0,max)}
 function normalized(v){return clean(v,200).normalize('NFKC').toLowerCase().replace(/\s+/g,' ').trim()}
-function participantKey(team,name,employeeId){const eid=normalized(employeeId);return eid?`emp:${eid}`:`person:${normalized(team)}\u0000${normalized(name)}`}
+function employeeIdHash(employeeId){const eid=normalized(employeeId);return eid?crypto.createHmac('sha256',HMAC_SECRET).update(eid,'utf8').digest('hex'):''}
+function participantKey(team,name,employeeId){const h=employeeIdHash(employeeId);return h?`emp:${h}`:`person:${normalized(team)}\u0000${normalized(name)}`}
+function safeHashEqual(a,b){const x=Buffer.from(String(a||''),'utf8'),y=Buffer.from(String(b||''),'utf8');return x.length===y.length&&x.length>0&&crypto.timingSafeEqual(x,y)}
 function isAdmin(req){const got=Buffer.from(String(req.headers['x-admin-key']||''));const want=Buffer.from(String(ADMIN_KEY));return got.length===want.length && crypto.timingSafeEqual(got,want)}
 function bodyJson(req){return new Promise((resolve,reject)=>{let d='';req.on('data',c=>{d+=c;if(d.length>2_000_000){reject(new Error('payload too large'));req.destroy()}});req.on('end',()=>{try{resolve(d?JSON.parse(d):{})}catch(e){reject(e)}});req.on('error',reject)})}
 function periodLabel(year,half){return `${year}년 ${Number(half)===1?'상반기':'하반기'}`}
 function currentDefaultPeriod(){const d=new Date();const year=d.getFullYear();const half=(d.getMonth()+1)<=6?1:2;return {year,half,label:periodLabel(year,half)}}
-function dbRowParticipant(r){return {id:r.id,team:r.team,name:r.name,employeeId:r.employee_id||''}}
+function dbRowParticipant(r){return {id:r.id,team:r.team,name:r.name,employeeIdRegistered:!!r.employee_id_hash}}
 function dbRowPeriod(r){return {id:r.id,year:Number(r.year),half:Number(r.half),label:r.label,isActive:!!r.is_active,createdAt:r.created_at instanceof Date?r.created_at.toISOString():String(r.created_at||'')}}
-function dbRowResult(r){return {participantId:r.participant_id,periodId:r.period_id,periodLabel:r.period_label||'',periodYear:Number(r.period_year||0),periodHalf:Number(r.period_half||0),team:r.team,name:r.name,employeeId:r.employee_id||'',answerScores:r.answer_scores||[],choiceNumbers:r.choice_numbers||[],axisScores:r.axis_scores||{},totalScore:Number(r.total_score||0),type:r.type||'',typeName:r.type_name||'',submittedAt:r.submitted_at instanceof Date?r.submitted_at.toISOString():String(r.submitted_at||'')}}
+function dbRowResult(r){return {participantId:r.participant_id,periodId:r.period_id,periodLabel:r.period_label||'',periodYear:Number(r.period_year||0),periodHalf:Number(r.period_half||0),team:r.team,name:r.name,answerScores:r.answer_scores||[],choiceNumbers:r.choice_numbers||[],axisScores:r.axis_scores||{},totalScore:Number(r.total_score||0),type:r.type||'',typeName:r.type_name||'',submittedAt:r.submitted_at instanceof Date?r.submitted_at.toISOString():String(r.submitted_at||'')}}
 function validateResult(b){
   const scores=b.answerScores,choices=b.choiceNumbers;
   if(!Array.isArray(scores)||scores.length!==24||!scores.every(v=>SCORE_VALUES.has(Number(v)))) return '핵심가치 문항 응답 형식이 올바르지 않습니다.';
@@ -72,7 +80,7 @@ async function initDb(){
       participant_key TEXT NOT NULL UNIQUE,
       team TEXT NOT NULL,
       name TEXT NOT NULL,
-      employee_id TEXT NOT NULL DEFAULT '',
+      employee_id_hash TEXT NOT NULL DEFAULT '',
       active BOOLEAN NOT NULL DEFAULT TRUE,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -88,6 +96,13 @@ async function initDb(){
       UNIQUE(year, half)
     );
   `);
+  await pool.query(`ALTER TABLE participants ADD COLUMN IF NOT EXISTS employee_id_hash TEXT NOT NULL DEFAULT ''`);
+  const legacyColumn=await pool.query(`SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='participants' AND column_name='employee_id' LIMIT 1`);
+  if(legacyColumn.rowCount){
+    const legacyRows=await pool.query(`SELECT id,employee_id FROM participants WHERE COALESCE(employee_id,'')<>'' AND COALESCE(employee_id_hash,'')=''`);
+    for(const row of legacyRows.rows){const h=employeeIdHash(row.employee_id);await pool.query(`UPDATE participants SET employee_id_hash=$1,participant_key=$2 WHERE id=$3`,[h,`emp:${h}`,row.id])}
+    await pool.query(`ALTER TABLE participants DROP COLUMN IF EXISTS employee_id`);
+  }
   let periods=await pool.query(`SELECT * FROM diagnosis_periods ORDER BY year,half`);
   if(!periods.rowCount){const p=currentDefaultPeriod();await pool.query(`INSERT INTO diagnosis_periods(id,year,half,label,is_active) VALUES($1,$2,$3,$4,TRUE)`,[crypto.randomUUID(),p.year,p.half,p.label]);}
   else if(!periods.rows.some(r=>r.is_active)){await pool.query(`UPDATE diagnosis_periods SET is_active=TRUE WHERE id=(SELECT id FROM diagnosis_periods ORDER BY year DESC,half DESC LIMIT 1)`)}
@@ -145,35 +160,36 @@ async function publicParticipants(){
 }
 async function resultHistory(participantId){
   participantId=clean(participantId,60);
-  if(USE_POSTGRES){const {rows}=await pool.query(`SELECT r.participant_id,r.period_id,d.label period_label,d.year period_year,d.half period_half,p.team,p.name,'' employee_id,r.answer_scores,r.choice_numbers,r.axis_scores,r.total_score,r.type,r.type_name,r.submitted_at FROM core_value_results r JOIN participants p ON p.id=r.participant_id JOIN diagnosis_periods d ON d.id=r.period_id WHERE r.participant_id=$1 AND p.active=TRUE ORDER BY d.year,d.half`,[participantId]);return rows.map(dbRowResult).map(({answerScores,choiceNumbers,employeeId,...x})=>x)}
-  const ps=await getPeriods();const pm=new Map(ps.map(p=>[p.id,p]));return readJson(RESULTS_FILE).filter(r=>r.participantId===participantId).map(r=>{const p=pm.get(r.periodId)||{};const {answerScores,choiceNumbers,employeeId,...x}=r;return {...x,periodLabel:p.label||r.periodLabel||'',periodYear:p.year||r.periodYear||0,periodHalf:p.half||r.periodHalf||0}}).sort((a,b)=>a.periodYear-b.periodYear||a.periodHalf-b.periodHalf);
+  if(USE_POSTGRES){const {rows}=await pool.query(`SELECT r.participant_id,r.period_id,d.label period_label,d.year period_year,d.half period_half,p.team,p.name,r.answer_scores,r.choice_numbers,r.axis_scores,r.total_score,r.type,r.type_name,r.submitted_at FROM core_value_results r JOIN participants p ON p.id=r.participant_id JOIN diagnosis_periods d ON d.id=r.period_id WHERE r.participant_id=$1 AND p.active=TRUE ORDER BY d.year,d.half`,[participantId]);return rows.map(dbRowResult).map(({answerScores,choiceNumbers,...x})=>x)}
+  const ps=await getPeriods();const pm=new Map(ps.map(p=>[p.id,p]));return readJson(RESULTS_FILE).filter(r=>r.participantId===participantId).map(r=>{const p=pm.get(r.periodId)||{};const {answerScores,choiceNumbers,employeeIdHash,employeeId,...x}=r;return {...x,periodLabel:p.label||r.periodLabel||'',periodYear:p.year||r.periodYear||0,periodHalf:p.half||r.periodHalf||0}}).sort((a,b)=>a.periodYear-b.periodYear||a.periodHalf-b.periodHalf);
 }
 async function adminData(){
   const periods=await getPeriods();
   if(USE_POSTGRES){
     const [p,r]=await Promise.all([
-      pool.query(`SELECT id,team,name,employee_id FROM participants WHERE active=TRUE ORDER BY team,name`),
-      pool.query(`SELECT r.participant_id,r.period_id,d.label period_label,d.year period_year,d.half period_half,p.team,p.name,p.employee_id,r.answer_scores,r.choice_numbers,r.axis_scores,r.total_score,r.type,r.type_name,r.submitted_at FROM core_value_results r JOIN participants p ON p.id=r.participant_id JOIN diagnosis_periods d ON d.id=r.period_id WHERE p.active=TRUE ORDER BY d.year DESC,d.half DESC,p.team,p.name`)
+      pool.query(`SELECT id,team,name,employee_id_hash FROM participants WHERE active=TRUE ORDER BY team,name`),
+      pool.query(`SELECT r.participant_id,r.period_id,d.label period_label,d.year period_year,d.half period_half,p.team,p.name,r.answer_scores,r.choice_numbers,r.axis_scores,r.total_score,r.type,r.type_name,r.submitted_at FROM core_value_results r JOIN participants p ON p.id=r.participant_id JOIN diagnosis_periods d ON d.id=r.period_id WHERE p.active=TRUE ORDER BY d.year DESC,d.half DESC,p.team,p.name`)
     ]);return {participants:p.rows.map(dbRowParticipant),results:r.rows.map(dbRowResult),periods,activePeriod:periods.find(x=>x.isActive)||null};
   }
-  const pm=new Map(periods.map(p=>[p.id,p]));const results=readJson(RESULTS_FILE).map(r=>{const p=pm.get(r.periodId)||{};return {...r,periodLabel:p.label||r.periodLabel||'',periodYear:p.year||r.periodYear||0,periodHalf:p.half||r.periodHalf||0}});return {participants:readJson(PARTICIPANTS_FILE).filter(p=>p.active!==false),results,periods,activePeriod:periods.find(x=>x.isActive)||null};
+  const pm=new Map(periods.map(p=>[p.id,p]));const results=readJson(RESULTS_FILE).map(r=>{const p=pm.get(r.periodId)||{};return {...r,periodLabel:p.label||r.periodLabel||'',periodYear:p.year||r.periodYear||0,periodHalf:p.half||r.periodHalf||0}});return {participants:readJson(PARTICIPANTS_FILE).filter(p=>p.active!==false).map(p=>({id:p.id,team:p.team,name:p.name,employeeIdRegistered:!!p.employeeIdHash})),results:results.map(({employeeIdHash,employeeId,...r})=>r),periods,activePeriod:periods.find(x=>x.isActive)||null};
 }
 async function verifyParticipantIdentity(participantId,employeeId){
   participantId=clean(participantId,60);employeeId=clean(employeeId,50);
   if(!participantId||!employeeId)return null;
-  if(USE_POSTGRES){const {rows}=await pool.query(`SELECT id,team,name,employee_id FROM participants WHERE id=$1 AND active=TRUE LIMIT 1`,[participantId]);if(!rows.length)return null;const p=rows[0];return normalized(p.employee_id)===normalized(employeeId)?{id:p.id,team:p.team,name:p.name}:null}
-  const p=readJson(PARTICIPANTS_FILE).find(x=>x.id===participantId&&x.active!==false);if(!p)return null;return normalized(p.employeeId)===normalized(employeeId)?{id:p.id,team:p.team,name:p.name}:null;
+  const incomingHash=employeeIdHash(employeeId);
+  if(USE_POSTGRES){const {rows}=await pool.query(`SELECT id,team,name,employee_id_hash FROM participants WHERE id=$1 AND active=TRUE LIMIT 1`,[participantId]);if(!rows.length)return null;const p=rows[0];return safeHashEqual(p.employee_id_hash,incomingHash)?{id:p.id,team:p.team,name:p.name}:null}
+  const p=readJson(PARTICIPANTS_FILE).find(x=>x.id===participantId&&x.active!==false);if(!p)return null;return safeHashEqual(p.employeeIdHash,incomingHash)?{id:p.id,team:p.team,name:p.name}:null;
 }
 async function replaceRoster(input){
-  const cleaned=[];const seen=new Set();for(const row of input){const team=clean(row.team),name=clean(row.name),employeeId=clean(row.employeeId,50);if(!team||!name||!employeeId)continue;const key=participantKey(team,name,employeeId);if(seen.has(key))continue;seen.add(key);cleaned.push({team,name,employeeId,key})}
-  if(USE_POSTGRES){const client=await pool.connect();try{await client.query('BEGIN');await client.query('UPDATE participants SET active=FALSE,updated_at=NOW() WHERE active=TRUE');for(const p of cleaned){await client.query(`INSERT INTO participants(id,participant_key,team,name,employee_id,active) VALUES($1,$2,$3,$4,$5,TRUE) ON CONFLICT(participant_key) DO UPDATE SET team=EXCLUDED.team,name=EXCLUDED.name,employee_id=EXCLUDED.employee_id,active=TRUE,updated_at=NOW()`,[crypto.randomUUID(),p.key,p.team,p.name,p.employeeId])}await client.query('COMMIT')}catch(e){await client.query('ROLLBACK');throw e}finally{client.release()}return cleaned.length}
-  const old=readJson(PARTICIPANTS_FILE);const oldByKey=new Map(old.map(p=>[p.key||participantKey(p.team,p.name,p.employeeId),p]));const participants=cleaned.map(p=>({id:oldByKey.get(p.key)?.id||crypto.randomUUID(),key:p.key,team:p.team,name:p.name,employeeId:p.employeeId,active:true}));writeJson(PARTICIPANTS_FILE,participants);return participants.length;
+  const cleaned=[];const seen=new Set();for(const row of input){const team=clean(row.team),name=clean(row.name),employeeId=clean(row.employeeId,50);if(!team||!name||!employeeId)continue;const employeeIdHashValue=employeeIdHash(employeeId);const key=`emp:${employeeIdHashValue}`;if(seen.has(key))continue;seen.add(key);cleaned.push({team,name,employeeIdHash:employeeIdHashValue,key})}
+  if(USE_POSTGRES){const client=await pool.connect();try{await client.query('BEGIN');await client.query('UPDATE participants SET active=FALSE,updated_at=NOW() WHERE active=TRUE');for(const p of cleaned){await client.query(`INSERT INTO participants(id,participant_key,team,name,employee_id_hash,active) VALUES($1,$2,$3,$4,$5,TRUE) ON CONFLICT(participant_key) DO UPDATE SET team=EXCLUDED.team,name=EXCLUDED.name,employee_id_hash=EXCLUDED.employee_id_hash,active=TRUE,updated_at=NOW()`,[crypto.randomUUID(),p.key,p.team,p.name,p.employeeIdHash])}await client.query('COMMIT')}catch(e){await client.query('ROLLBACK');throw e}finally{client.release()}return cleaned.length}
+  let old=readJson(PARTICIPANTS_FILE);old=old.map(p=>{if(p.employeeIdHash)return p;const legacy=p.employeeId?employeeIdHash(p.employeeId):'';return {...p,key:legacy?`emp:${legacy}`:p.key,employeeIdHash:legacy,employeeId:undefined}});const oldByKey=new Map(old.map(p=>[p.key,p]));const participants=cleaned.map(p=>({id:oldByKey.get(p.key)?.id||crypto.randomUUID(),key:p.key,team:p.team,name:p.name,employeeIdHash:p.employeeIdHash,active:true}));writeJson(PARTICIPANTS_FILE,participants);return participants.length;
 }
 async function saveResult(b){
   const validation=validateResult(b);if(validation)return {error:validation,status:400};const active=await getActivePeriod();if(!active)return {error:'활성 진단 기간이 설정되지 않았습니다.',status:400};
   const verified=await verifyParticipantIdentity(b.participantId,b.employeeId);if(!verified)return {error:'본인 확인 정보가 일치하지 않습니다.',status:401};
   if(USE_POSTGRES){await pool.query(`INSERT INTO core_value_results(participant_id,period_id,answer_scores,choice_numbers,axis_scores,total_score,type,type_name,submitted_at,updated_at) VALUES($1,$2,$3::jsonb,$4::jsonb,$5::jsonb,$6,$7,$8,NOW(),NOW()) ON CONFLICT(participant_id,period_id) DO UPDATE SET answer_scores=EXCLUDED.answer_scores,choice_numbers=EXCLUDED.choice_numbers,axis_scores=EXCLUDED.axis_scores,total_score=EXCLUDED.total_score,type=EXCLUDED.type,type_name=EXCLUDED.type_name,submitted_at=NOW(),updated_at=NOW()`,[b.participantId,active.id,JSON.stringify(b.answerScores.map(Number)),JSON.stringify(b.choiceNumbers.map(Number)),JSON.stringify(b.axisScores),Math.round(Number(b.totalScore)),clean(b.type,10),clean(b.typeName,100)]);return {ok:true,period:active}}
-  const participants=readJson(PARTICIPANTS_FILE),p=participants.find(x=>x.id===b.participantId&&x.active!==false);if(!p)return {error:'등록되지 않은 직원입니다.',status:400};const result={participantId:p.id,periodId:active.id,periodLabel:active.label,periodYear:active.year,periodHalf:active.half,team:p.team,name:p.name,employeeId:p.employeeId||'',answerScores:b.answerScores.map(Number),choiceNumbers:b.choiceNumbers.map(Number),axisScores:b.axisScores,totalScore:Math.round(Number(b.totalScore)),type:clean(b.type,10),typeName:clean(b.typeName,100),submittedAt:new Date().toISOString()};let results=readJson(RESULTS_FILE);const i=results.findIndex(x=>x.participantId===p.id&&x.periodId===active.id);if(i>=0)results[i]=result;else results.push(result);writeJson(RESULTS_FILE,results);return {ok:true,period:active};
+  const participants=readJson(PARTICIPANTS_FILE),p=participants.find(x=>x.id===b.participantId&&x.active!==false);if(!p)return {error:'등록되지 않은 직원입니다.',status:400};const result={participantId:p.id,periodId:active.id,periodLabel:active.label,periodYear:active.year,periodHalf:active.half,team:p.team,name:p.name,answerScores:b.answerScores.map(Number),choiceNumbers:b.choiceNumbers.map(Number),axisScores:b.axisScores,totalScore:Math.round(Number(b.totalScore)),type:clean(b.type,10),typeName:clean(b.typeName,100),submittedAt:new Date().toISOString()};let results=readJson(RESULTS_FILE);const i=results.findIndex(x=>x.participantId===p.id&&x.periodId===active.id);if(i>=0)results[i]=result;else results.push(result);writeJson(RESULTS_FILE,results);return {ok:true,period:active};
 }
 
 async function api(req,res,pathname){
@@ -193,5 +209,5 @@ async function api(req,res,pathname){
 function serveStatic(req,res,pathname){let rel=pathname==='/'?'index.html':decodeURIComponent(pathname.replace(/^\//,''));rel=path.normalize(rel).replace(/^(\.\.[/\\])+/, '');const file=path.join(ROOT,rel);if(!file.startsWith(ROOT)||!fs.existsSync(file)||fs.statSync(file).isDirectory())return serveIndex(res);const buf=fs.readFileSync(file),ext=path.extname(file).toLowerCase();res.writeHead(200,{'Content-Type':MIME[ext]||'application/octet-stream','Content-Length':buf.length,'Cache-Control':ext==='.html'?'no-store':'public, max-age=3600'});res.end(buf)}
 function serveIndex(res){const file=path.join(ROOT,'index.html');const buf=fs.readFileSync(file);res.writeHead(200,{'Content-Type':'text/html; charset=utf-8','Content-Length':buf.length,'Cache-Control':'no-store'});res.end(buf)}
 const server=http.createServer(async(req,res)=>{const pathname=url.parse(req.url).pathname;try{if(pathname==='/health'){if(USE_POSTGRES)await pool.query('SELECT 1');return send(res,200,{ok:true,storage:USE_POSTGRES?'postgres':'json',activePeriod:await getActivePeriod()})}if(pathname.startsWith('/api/'))return await api(req,res,pathname);return serveStatic(req,res,pathname)}catch(e){console.error(e);return send(res,500,{error:'서버 오류가 발생했습니다.'})}});
-initDb().then(async()=>{if(!USE_POSTGRES)await ensureLocalPeriod();server.listen(PORT,HOST,()=>{console.log(`NAVIMRO server running on http://${HOST}:${PORT}`);console.log(`Storage: ${USE_POSTGRES?'PostgreSQL':'JSON local fallback'}`);if(ADMIN_KEY==='change-me-before-deploy')console.warn('WARNING: ADMIN_KEY 환경변수를 반드시 변경하세요.');if(!USE_POSTGRES)console.warn('WARNING: DATABASE_URL이 없습니다. JSON 모드는 로컬 테스트용이며 Render 운영에는 PostgreSQL을 연결하세요.')})}).catch(err=>{console.error('Database initialization failed:',err);process.exit(1)});
+initDb().then(async()=>{if(!USE_POSTGRES)await ensureLocalPeriod();server.listen(PORT,HOST,()=>{console.log(`NAVIMRO server running on http://${HOST}:${PORT}`);console.log(`Storage: ${USE_POSTGRES?'PostgreSQL':'JSON local fallback'}`);if(ADMIN_KEY==='change-me-before-deploy')console.warn('WARNING: ADMIN_KEY 환경변수를 반드시 변경하세요.');if(!EMPLOYEE_ID_HMAC_SECRET)console.warn('WARNING: 로컬 테스트용 HMAC secret을 사용 중입니다. 운영에서는 EMPLOYEE_ID_HMAC_SECRET을 설정하세요.');if(!USE_POSTGRES)console.warn('WARNING: DATABASE_URL이 없습니다. JSON 모드는 로컬 테스트용이며 Render 운영에는 PostgreSQL을 연결하세요.')})}).catch(err=>{console.error('Database initialization failed:',err);process.exit(1)});
 process.on('SIGTERM',async()=>{if(pool)await pool.end().catch(()=>{});server.close(()=>process.exit(0))});
