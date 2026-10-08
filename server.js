@@ -39,13 +39,32 @@ const MIME = {'.html':'text/html; charset=utf-8','.js':'application/javascript; 
 const AXIS_KEYS = ['OF','RP','CS','LE'];
 const SCORE_VALUES = new Set([3,2,1,-1,-2,-3]);
 const CHOICE_VALUES = new Set([1,2,3,4,5,6]);
+const AUTH_FAILURE_WINDOW_MS = 10 * 60 * 1000;
+const AUTH_FAILURE_LIMIT = 5;
+const authFailures = new Map();
 
 function readJson(f){try{return JSON.parse(fs.readFileSync(f,'utf8'))}catch{return []}}
 function writeJson(f,d){const t=f+'.tmp';fs.writeFileSync(t,JSON.stringify(d,null,2),'utf8');fs.renameSync(t,f)}
 function send(res,status,obj,headers={}){const body=Buffer.from(typeof obj==='string'?obj:JSON.stringify(obj));res.writeHead(status,{'Content-Type':typeof obj==='string'?'text/plain; charset=utf-8':'application/json; charset=utf-8','Content-Length':body.length,'Cache-Control':'no-store',...headers});res.end(body)}
 function clean(v,max=100){return String(v??'').trim().slice(0,max)}
 function normalized(v){return clean(v,200).normalize('NFKC').toLowerCase().replace(/\s+/g,' ').trim()}
+function normalizedPersonName(v){return normalized(v).replace(/\s+/g,'')}
 function employeeIdHash(employeeId){const eid=normalized(employeeId);return eid?crypto.createHmac('sha256',HMAC_SECRET).update(eid,'utf8').digest('hex'):''}
+function clientIp(req){const forwarded=clean(req.headers['x-forwarded-for']||'',300).split(',')[0].trim();return forwarded||String(req.socket?.remoteAddress||'unknown')}
+function authAttemptKey(req,name){return `${clientIp(req)}|${normalizedPersonName(name)}`}
+function authAttemptBlocked(key){
+  const now=Date.now(),state=authFailures.get(key);
+  if(!state)return false;
+  if(now-state.firstAt>=AUTH_FAILURE_WINDOW_MS){authFailures.delete(key);return false}
+  return state.count>=AUTH_FAILURE_LIMIT;
+}
+function recordAuthFailure(key){
+  const now=Date.now(),state=authFailures.get(key);
+  if(!state||now-state.firstAt>=AUTH_FAILURE_WINDOW_MS)authFailures.set(key,{count:1,firstAt:now});
+  else authFailures.set(key,{count:state.count+1,firstAt:state.firstAt});
+  if(authFailures.size>5000){for(const [k,v] of authFailures){if(now-v.firstAt>=AUTH_FAILURE_WINDOW_MS)authFailures.delete(k)}}
+}
+function clearAuthFailures(key){authFailures.delete(key)}
 function participantKey(team,name,employeeId){const h=employeeIdHash(employeeId);return h?`emp:${h}`:`person:${normalized(team)}\u0000${normalized(name)}`}
 function safeHashEqual(a,b){const x=Buffer.from(String(a||''),'utf8'),y=Buffer.from(String(b||''),'utf8');return x.length===y.length&&x.length>0&&crypto.timingSafeEqual(x,y)}
 function isAdmin(req){const got=Buffer.from(String(req.headers['x-admin-key']||''));const want=Buffer.from(String(ADMIN_KEY));return got.length===want.length && crypto.timingSafeEqual(got,want)}
@@ -97,6 +116,7 @@ async function initDb(){
     );
   `);
   await pool.query(`ALTER TABLE participants ADD COLUMN IF NOT EXISTS employee_id_hash TEXT NOT NULL DEFAULT ''`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_participants_active_employee_hash ON participants(active, employee_id_hash)`);
   const legacyColumn=await pool.query(`SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='participants' AND column_name='employee_id' LIMIT 1`);
   if(legacyColumn.rowCount){
     const legacyRows=await pool.query(`SELECT id,employee_id FROM participants WHERE COALESCE(employee_id,'')<>'' AND COALESCE(employee_id_hash,'')=''`);
@@ -153,16 +173,6 @@ async function activatePeriod(periodId){
   let ps=await ensureLocalPeriod();if(!ps.some(p=>p.id===periodId))throw new Error('진단 기간을 찾을 수 없습니다.');ps=ps.map(p=>({...p,isActive:p.id===periodId}));writeJson(PERIODS_FILE,ps);
 }
 
-async function publicParticipants(){
-  const activePeriod=await getActivePeriod();
-  if(USE_POSTGRES){
-    const periodId=activePeriod?.id||null;
-    const {rows}=await pool.query(`SELECT p.id,p.team,p.name,CASE WHEN $1::uuid IS NULL THEN FALSE ELSE EXISTS(SELECT 1 FROM core_value_results r WHERE r.participant_id=p.id AND r.period_id=$1::uuid) END AS completed FROM participants p WHERE p.active=TRUE ORDER BY p.team,p.name`,[periodId]);
-    return {participants:rows.map(r=>({id:r.id,team:r.team,name:r.name,completed:!!r.completed})),activePeriod};
-  }
-  const done=new Set(activePeriod?readJson(RESULTS_FILE).filter(r=>r.periodId===activePeriod.id).map(r=>r.participantId):[]);
-  return {participants:readJson(PARTICIPANTS_FILE).filter(p=>p.active!==false).map(({id,team,name})=>({id,team,name,completed:done.has(id)})),activePeriod};
-}
 async function currentResultForParticipant(participantId){
   participantId=clean(participantId,60);
   const active=await getActivePeriod();if(!active||!participantId)return null;
@@ -209,6 +219,20 @@ async function verifyParticipantIdentity(participantId,employeeId){
   if(USE_POSTGRES){const {rows}=await pool.query(`SELECT id,team,name,employee_id_hash FROM participants WHERE id=$1 AND active=TRUE LIMIT 1`,[participantId]);if(!rows.length)return null;const p=rows[0];return safeHashEqual(p.employee_id_hash,incomingHash)?{id:p.id,team:p.team,name:p.name}:null}
   const p=readJson(PARTICIPANTS_FILE).find(x=>x.id===participantId&&x.active!==false);if(!p)return null;return safeHashEqual(p.employeeIdHash,incomingHash)?{id:p.id,team:p.team,name:p.name}:null;
 }
+async function verifyParticipantByNameEmployeeId(name,employeeId){
+  name=clean(name,100);employeeId=clean(employeeId,50);
+  if(!name||!employeeId)return null;
+  const incomingHash=employeeIdHash(employeeId),incomingName=normalizedPersonName(name);
+  if(USE_POSTGRES){
+    const {rows}=await pool.query(`SELECT id,team,name,employee_id_hash FROM participants WHERE active=TRUE AND employee_id_hash=$1 LIMIT 1`,[incomingHash]);
+    if(!rows.length)return null;
+    const p=rows[0];
+    return safeHashEqual(p.employee_id_hash,incomingHash)&&normalizedPersonName(p.name)===incomingName?{id:p.id,team:p.team,name:p.name}:null;
+  }
+  const p=readJson(PARTICIPANTS_FILE).find(x=>x.active!==false&&safeHashEqual(x.employeeIdHash,incomingHash));
+  if(!p||normalizedPersonName(p.name)!==incomingName)return null;
+  return {id:p.id,team:p.team,name:p.name};
+}
 async function replaceRoster(input){
   const cleaned=[];const seen=new Set();for(const row of input){const team=clean(row.team),name=clean(row.name),employeeId=clean(row.employeeId,50);if(!team||!name||!employeeId)continue;const employeeIdHashValue=employeeIdHash(employeeId);const key=`emp:${employeeIdHashValue}`;if(seen.has(key))continue;seen.add(key);cleaned.push({team,name,employeeIdHash:employeeIdHashValue,key})}
   if(USE_POSTGRES){const client=await pool.connect();try{await client.query('BEGIN');await client.query('UPDATE participants SET active=FALSE,updated_at=NOW() WHERE active=TRUE');for(const p of cleaned){await client.query(`INSERT INTO participants(id,participant_key,team,name,employee_id_hash,active) VALUES($1,$2,$3,$4,$5,TRUE) ON CONFLICT(participant_key) DO UPDATE SET team=EXCLUDED.team,name=EXCLUDED.name,employee_id_hash=EXCLUDED.employee_id_hash,active=TRUE,updated_at=NOW()`,[crypto.randomUUID(),p.key,p.team,p.name,p.employeeIdHash])}await client.query('COMMIT')}catch(e){await client.query('ROLLBACK');throw e}finally{client.release()}return cleaned.length}
@@ -223,8 +247,16 @@ async function saveResult(b){
 }
 
 async function api(req,res,pathname){
-  if(req.method==='GET'&&pathname==='/api/participants')return send(res,200,await publicParticipants());
-  if(req.method==='POST'&&pathname==='/api/participant/verify'){const b=await bodyJson(req);const participant=await verifyParticipantIdentity(b.participantId,b.employeeId);if(!participant)return send(res,401,{error:'팀/성명과 사번이 일치하지 않습니다.'});const currentResult=await currentResultForParticipant(participant.id);return send(res,200,{ok:true,participant,activePeriod:await getActivePeriod(),completed:!!currentResult,currentResult})}
+  if(req.method==='GET'&&pathname==='/api/period/active')return send(res,200,{activePeriod:await getActivePeriod()});
+  if(req.method==='POST'&&pathname==='/api/participant/verify'){
+    const b=await bodyJson(req),name=clean(b.name,100),employeeId=clean(b.employeeId,50),attemptKey=authAttemptKey(req,name);
+    if(authAttemptBlocked(attemptKey))return send(res,429,{error:'본인 확인 시도가 여러 번 실패했습니다. 잠시 후 다시 시도해주세요.'});
+    const participant=await verifyParticipantByNameEmployeeId(name,employeeId);
+    if(!participant){recordAuthFailure(attemptKey);return send(res,401,{error:'성명 또는 사번이 일치하지 않습니다.'})}
+    clearAuthFailures(attemptKey);
+    const currentResult=await currentResultForParticipant(participant.id);
+    return send(res,200,{ok:true,participant,activePeriod:await getActivePeriod(),completed:!!currentResult,currentResult});
+  }
   if(req.method==='POST'&&pathname==='/api/results/history'){const b=await bodyJson(req);const participant=await verifyParticipantIdentity(b.participantId,b.employeeId);if(!participant)return send(res,401,{error:'본인 확인 정보가 일치하지 않습니다.'});return send(res,200,{results:await resultHistory(participant.id),activePeriod:await getActivePeriod()})}
   if(req.method==='POST'&&pathname==='/api/results/detail'){const b=await bodyJson(req);const participant=await verifyParticipantIdentity(b.participantId,b.employeeId);if(!participant)return send(res,401,{error:'본인 확인 정보가 일치하지 않습니다.'});const result=await resultForParticipantPeriod(participant.id,b.periodId);if(!result)return send(res,404,{error:'선택한 반기의 결과가 없습니다.'});return send(res,200,{result,activePeriod:await getActivePeriod()})}
   if(pathname.startsWith('/api/admin/')&&!isAdmin(req))return send(res,401,{error:'관리자 인증에 실패했습니다.'});
