@@ -316,3 +316,24 @@ npm.cmd start
 - 메인 첫 화면에 “왜 핵심가치를 내재화해야 할까요?” 안내 영역 추가
 - 판단의 기준 / 협업의 기준 / 성장의 기준 3가지로 진단 목적을 간단히 설명
 - 모바일에서는 3개 항목을 세로 배치하도록 반응형 적용
+
+## v31 responsive balance
+- 직원 진단 화면을 iPhone/Galaxy/대화면 폰/태블릿/PC 구간별로 재조정했습니다.
+- 모바일 질문/상황/A-B 선택문구/응답 버튼의 글자와 터치영역을 키웠습니다.
+- 긴 화면에서는 선택척도와 다음 버튼이 화면 하단 쪽에 자연스럽게 배치되어 상단 편중을 줄입니다.
+- 480~699px 대화면 폰/폴더블에서 430px 고정폭을 해제해 가용 폭을 사용합니다.
+- 태블릿 세로 화면은 세로 여백을 분산하고, PC는 읽기 폭을 약 960px로 제한해 과도한 가로 확장을 방지합니다.
+- iOS safe-area 대응을 위해 viewport-fit=cover를 추가했습니다.
+
+## v32 - Mobile/iPad answer button state fix
+- iOS/iPadOS Safari에서 이전 문항에 눌렀던 응답 버튼의 테두리/색상이 다음 문항에 부분적으로 남아 보이는 현상 수정
+- 문항 전환 시 응답 버튼 DOM을 새로 생성하여 touch/focus/compositor 잔상을 제거
+- 응답 버튼에 appearance/tap-highlight/focus 스타일을 명시해 iPhone/Galaxy/Tablet/PC 간 상태 표현을 통일
+- sticky 응답/내비게이션 영역의 backdrop blur를 제거해 Safari 합성 레이어 잔상을 방지
+
+
+## v33 desktop scale balance
+- v32 누적 기능 유지
+- 1200px 이상 PC 화면에서 안내/본인확인 폭과 글자·입력·버튼 크기 확대
+- PC 진단 화면 읽기 폭을 1120px로 확대
+- 모바일/태블릿/관리자 레이아웃은 변경하지 않음
