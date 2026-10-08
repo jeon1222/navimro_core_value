@@ -155,8 +155,37 @@ async function activatePeriod(periodId){
 
 async function publicParticipants(){
   const activePeriod=await getActivePeriod();
-  if(USE_POSTGRES){const {rows}=await pool.query(`SELECT id,team,name FROM participants WHERE active=TRUE ORDER BY team,name`);return {participants:rows.map(r=>({id:r.id,team:r.team,name:r.name})),activePeriod}}
-  return {participants:readJson(PARTICIPANTS_FILE).filter(p=>p.active!==false).map(({id,team,name})=>({id,team,name})),activePeriod};
+  if(USE_POSTGRES){
+    const periodId=activePeriod?.id||null;
+    const {rows}=await pool.query(`SELECT p.id,p.team,p.name,CASE WHEN $1::uuid IS NULL THEN FALSE ELSE EXISTS(SELECT 1 FROM core_value_results r WHERE r.participant_id=p.id AND r.period_id=$1::uuid) END AS completed FROM participants p WHERE p.active=TRUE ORDER BY p.team,p.name`,[periodId]);
+    return {participants:rows.map(r=>({id:r.id,team:r.team,name:r.name,completed:!!r.completed})),activePeriod};
+  }
+  const done=new Set(activePeriod?readJson(RESULTS_FILE).filter(r=>r.periodId===activePeriod.id).map(r=>r.participantId):[]);
+  return {participants:readJson(PARTICIPANTS_FILE).filter(p=>p.active!==false).map(({id,team,name})=>({id,team,name,completed:done.has(id)})),activePeriod};
+}
+async function currentResultForParticipant(participantId){
+  participantId=clean(participantId,60);
+  const active=await getActivePeriod();if(!active||!participantId)return null;
+  if(USE_POSTGRES){
+    const {rows}=await pool.query(`SELECT r.participant_id,r.period_id,d.label period_label,d.year period_year,d.half period_half,p.team,p.name,r.answer_scores,r.choice_numbers,r.axis_scores,r.total_score,r.type,r.type_name,r.submitted_at FROM core_value_results r JOIN participants p ON p.id=r.participant_id JOIN diagnosis_periods d ON d.id=r.period_id WHERE r.participant_id=$1 AND r.period_id=$2 AND p.active=TRUE LIMIT 1`,[participantId,active.id]);
+    return rows.length?dbRowResult(rows[0]):null;
+  }
+  const p=readJson(PARTICIPANTS_FILE).find(x=>x.id===participantId&&x.active!==false);if(!p)return null;
+  const r=readJson(RESULTS_FILE).find(x=>x.participantId===participantId&&x.periodId===active.id);
+  return r?{...r,team:p.team,name:p.name,periodLabel:active.label,periodYear:active.year,periodHalf:active.half}:null;
+}
+async function resultForParticipantPeriod(participantId,periodId){
+  participantId=clean(participantId,60);periodId=clean(periodId,60);
+  if(!participantId||!periodId)return null;
+  if(USE_POSTGRES){
+    const {rows}=await pool.query(`SELECT r.participant_id,r.period_id,d.label period_label,d.year period_year,d.half period_half,p.team,p.name,r.answer_scores,r.choice_numbers,r.axis_scores,r.total_score,r.type,r.type_name,r.submitted_at FROM core_value_results r JOIN participants p ON p.id=r.participant_id JOIN diagnosis_periods d ON d.id=r.period_id WHERE r.participant_id=$1 AND r.period_id=$2 AND p.active=TRUE LIMIT 1`,[participantId,periodId]);
+    return rows.length?dbRowResult(rows[0]):null;
+  }
+  const participant=readJson(PARTICIPANTS_FILE).find(x=>x.id===participantId&&x.active!==false);if(!participant)return null;
+  const period=(await getPeriods()).find(x=>x.id===periodId);if(!period)return null;
+  const r=readJson(RESULTS_FILE).find(x=>x.participantId===participantId&&x.periodId===periodId);if(!r)return null;
+  const {employeeIdHash,employeeId,...safe}=r;
+  return {...safe,team:participant.team,name:participant.name,periodLabel:period.label||r.periodLabel||'',periodYear:period.year||r.periodYear||0,periodHalf:period.half||r.periodHalf||0};
 }
 async function resultHistory(participantId){
   participantId=clean(participantId,60);
@@ -188,14 +217,16 @@ async function replaceRoster(input){
 async function saveResult(b){
   const validation=validateResult(b);if(validation)return {error:validation,status:400};const active=await getActivePeriod();if(!active)return {error:'활성 진단 기간이 설정되지 않았습니다.',status:400};
   const verified=await verifyParticipantIdentity(b.participantId,b.employeeId);if(!verified)return {error:'본인 확인 정보가 일치하지 않습니다.',status:401};
-  if(USE_POSTGRES){await pool.query(`INSERT INTO core_value_results(participant_id,period_id,answer_scores,choice_numbers,axis_scores,total_score,type,type_name,submitted_at,updated_at) VALUES($1,$2,$3::jsonb,$4::jsonb,$5::jsonb,$6,$7,$8,NOW(),NOW()) ON CONFLICT(participant_id,period_id) DO UPDATE SET answer_scores=EXCLUDED.answer_scores,choice_numbers=EXCLUDED.choice_numbers,axis_scores=EXCLUDED.axis_scores,total_score=EXCLUDED.total_score,type=EXCLUDED.type,type_name=EXCLUDED.type_name,submitted_at=NOW(),updated_at=NOW()`,[b.participantId,active.id,JSON.stringify(b.answerScores.map(Number)),JSON.stringify(b.choiceNumbers.map(Number)),JSON.stringify(b.axisScores),Math.round(Number(b.totalScore)),clean(b.type,10),clean(b.typeName,100)]);return {ok:true,period:active}}
-  const participants=readJson(PARTICIPANTS_FILE),p=participants.find(x=>x.id===b.participantId&&x.active!==false);if(!p)return {error:'등록되지 않은 직원입니다.',status:400};const result={participantId:p.id,periodId:active.id,periodLabel:active.label,periodYear:active.year,periodHalf:active.half,team:p.team,name:p.name,answerScores:b.answerScores.map(Number),choiceNumbers:b.choiceNumbers.map(Number),axisScores:b.axisScores,totalScore:Math.round(Number(b.totalScore)),type:clean(b.type,10),typeName:clean(b.typeName,100),submittedAt:new Date().toISOString()};let results=readJson(RESULTS_FILE);const i=results.findIndex(x=>x.participantId===p.id&&x.periodId===active.id);if(i>=0)results[i]=result;else results.push(result);writeJson(RESULTS_FILE,results);return {ok:true,period:active};
+  const existing=await currentResultForParticipant(b.participantId);if(existing)return {error:'이번 진단 기간은 이미 완료되었습니다. 본인 확인 후 기존 결과를 확인해 주세요.',status:409};
+  if(USE_POSTGRES){await pool.query(`INSERT INTO core_value_results(participant_id,period_id,answer_scores,choice_numbers,axis_scores,total_score,type,type_name,submitted_at,updated_at) VALUES($1,$2,$3::jsonb,$4::jsonb,$5::jsonb,$6,$7,$8,NOW(),NOW())`,[b.participantId,active.id,JSON.stringify(b.answerScores.map(Number)),JSON.stringify(b.choiceNumbers.map(Number)),JSON.stringify(b.axisScores),Math.round(Number(b.totalScore)),clean(b.type,10),clean(b.typeName,100)]);return {ok:true,period:active}}
+  const participants=readJson(PARTICIPANTS_FILE),p=participants.find(x=>x.id===b.participantId&&x.active!==false);if(!p)return {error:'등록되지 않은 직원입니다.',status:400};const result={participantId:p.id,periodId:active.id,periodLabel:active.label,periodYear:active.year,periodHalf:active.half,team:p.team,name:p.name,answerScores:b.answerScores.map(Number),choiceNumbers:b.choiceNumbers.map(Number),axisScores:b.axisScores,totalScore:Math.round(Number(b.totalScore)),type:clean(b.type,10),typeName:clean(b.typeName,100),submittedAt:new Date().toISOString()};let results=readJson(RESULTS_FILE);results.push(result);writeJson(RESULTS_FILE,results);return {ok:true,period:active};
 }
 
 async function api(req,res,pathname){
   if(req.method==='GET'&&pathname==='/api/participants')return send(res,200,await publicParticipants());
-  if(req.method==='POST'&&pathname==='/api/participant/verify'){const b=await bodyJson(req);const participant=await verifyParticipantIdentity(b.participantId,b.employeeId);if(!participant)return send(res,401,{error:'팀/성명과 사번이 일치하지 않습니다.'});return send(res,200,{ok:true,participant,activePeriod:await getActivePeriod()})}
+  if(req.method==='POST'&&pathname==='/api/participant/verify'){const b=await bodyJson(req);const participant=await verifyParticipantIdentity(b.participantId,b.employeeId);if(!participant)return send(res,401,{error:'팀/성명과 사번이 일치하지 않습니다.'});const currentResult=await currentResultForParticipant(participant.id);return send(res,200,{ok:true,participant,activePeriod:await getActivePeriod(),completed:!!currentResult,currentResult})}
   if(req.method==='POST'&&pathname==='/api/results/history'){const b=await bodyJson(req);const participant=await verifyParticipantIdentity(b.participantId,b.employeeId);if(!participant)return send(res,401,{error:'본인 확인 정보가 일치하지 않습니다.'});return send(res,200,{results:await resultHistory(participant.id),activePeriod:await getActivePeriod()})}
+  if(req.method==='POST'&&pathname==='/api/results/detail'){const b=await bodyJson(req);const participant=await verifyParticipantIdentity(b.participantId,b.employeeId);if(!participant)return send(res,401,{error:'본인 확인 정보가 일치하지 않습니다.'});const result=await resultForParticipantPeriod(participant.id,b.periodId);if(!result)return send(res,404,{error:'선택한 반기의 결과가 없습니다.'});return send(res,200,{result,activePeriod:await getActivePeriod()})}
   if(pathname.startsWith('/api/admin/')&&!isAdmin(req))return send(res,401,{error:'관리자 인증에 실패했습니다.'});
   if(req.method==='GET'&&pathname==='/api/admin/status'){let dbOk=true;if(USE_POSTGRES){try{await pool.query('SELECT 1')}catch{dbOk=false}}return send(res,200,{storage:USE_POSTGRES?'PostgreSQL':'JSON (local test only)',databaseConnected:dbOk,activePeriod:await getActivePeriod()})}
   if(req.method==='POST'&&pathname==='/api/admin/participants'){const b=await bodyJson(req);const input=Array.isArray(b.participants)?b.participants:[];const count=await replaceRoster(input);return send(res,200,{ok:true,count})}
