@@ -1414,4 +1414,122 @@ document.getElementById('rankRefreshBtn').onclick=renderRankings;document.getEle
 document.getElementById('adminResultBody').onclick=e=>{const b=e.target.closest('[data-detail]');if(b)showAdminDetail(b.dataset.detail,b.dataset.period)};
 loadAuthContext();
 </script>
+<script>
+/* NAVIMRO team-leader PDF pagination — keep semantic cards intact. */
+(function () {
+  'use strict';
+  const PAGE_WIDTH = 900;
+  // A4 usable width 190 mm, height 271 mm. Reserve extra space for rounding / fonts.
+  const MAX_SHEET_HEIGHT = Math.floor(PAGE_WIDTH * 271 / 190) - 24;
+  const KEEP_TOGETHER = '.pdfSection,.pdfTwoCol,.pdfReportHeader,.pdfPurpose,.pdfMetricGrid,.pdfPersonHero,.pdfReportEnd';
+  const css = document.createElement('style');
+  css.textContent = `
+    .pdfReportSheet.pdfPaginated{padding:30px 38px 30px;line-height:1.58;overflow:visible}
+    .pdfPaginated .pdfSection{margin-bottom:12px;padding:15px 17px;overflow:visible}
+    .pdfPaginated .pdfSectionTitle{margin-bottom:10px;break-after:avoid}
+    .pdfPaginated .pdfSection .p{font-size:13px;line-height:1.7;overflow-wrap:anywhere;white-space:normal}
+    .pdfPaginated .pdfBullet{font-size:12px;line-height:1.65;overflow-wrap:anywhere}
+    .pdfPaginated .pdfOpposite,.pdfPaginated .pdfPurpose{overflow-wrap:anywhere;white-space:normal}
+    .pdfPaginated .pdfTwoCol{align-items:start;gap:12px}
+    .pdfPaginated .pdfTwoCol .pdfSection{margin-bottom:0}
+    .pdfPaginated .pdfCompactTable{table-layout:fixed;overflow-wrap:anywhere;word-break:keep-all}
+    .pdfPaginated .pdfCompactTable th,.pdfPaginated .pdfCompactTable td{white-space:normal;overflow-wrap:anywhere;line-height:1.5}
+    .pdfPaginated .bipolarProfile{gap:11px}
+    .pdfPaginated .bipolarRow{margin-bottom:0}
+    .pdfPaginated .pdfReportEnd{margin-top:8px}
+  `;
+  document.head.appendChild(css);
+
+  function splitLargeBlock(block) {
+    // Only split when an entire semantic card exceeds one printed page.
+    if (block.matches('.pdfTwoCol')) return Array.from(block.children).map(x => x.cloneNode(true));
+    if (!block.matches('.pdfSection')) return [block];
+    const title = block.querySelector(':scope > .pdfSectionTitle');
+    const content = Array.from(block.children).filter(x => x !== title);
+    if (!content.length) return [block];
+    const chunks=[];
+    for(const child of content) {
+      if(child.matches('.pdfBulletList,.bipolarProfile')) {
+        const entries=Array.from(child.children);
+        if(entries.length){
+          for(const entry of entries){const section=block.cloneNode(false);if(title)section.appendChild(title.cloneNode(true));const wrap=child.cloneNode(false);wrap.appendChild(entry.cloneNode(true));section.appendChild(wrap);chunks.push(section)}
+          continue;
+        }
+      }
+      if(child.matches('table')) {
+        const rows=Array.from(child.querySelectorAll('tbody > tr'));
+        if(rows.length){for(const row of rows){const section=block.cloneNode(false);if(title)section.appendChild(title.cloneNode(true));const table=child.cloneNode(false),thead=child.querySelector('thead');if(thead)table.appendChild(thead.cloneNode(true));const tbody=document.createElement('tbody');tbody.appendChild(row.cloneNode(true));table.appendChild(tbody);section.appendChild(table);chunks.push(section)}continue;}
+      }
+      const section=block.cloneNode(false);if(title)section.appendChild(title.cloneNode(true));section.appendChild(child.cloneNode(true));chunks.push(section);
+    }
+    return chunks.length?chunks:[block];
+  }
+
+  async function reportPageCanvas(html) {
+    const host=pdfRenderHost(), node=document.createElement('div');
+    node.className='pdfReportSheet pdfPaginated'; node.innerHTML=html;host.appendChild(node);
+    if(document.fonts?.ready)await document.fonts.ready;
+    await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));
+    try{return await html2canvas(node,{backgroundColor:'#ffffff',scale:1.25,useCORS:true,logging:false,windowWidth:900,scrollX:0,scrollY:0});}
+    finally{node.remove();}
+  }
+  async function buildPages(html) {
+    const host=pdfRenderHost();
+    const measure=document.createElement('div');
+    measure.className='pdfReportSheet pdfPaginated';
+    measure.innerHTML=html;
+    host.appendChild(measure);
+    if(document.fonts?.ready)await document.fonts.ready;
+    await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+    const originalBlocks=Array.from(measure.children).map(x=>x.cloneNode(true));
+    const pages=[];
+    const newPage=()=>{const sheet=document.createElement('div');sheet.className='pdfReportSheet pdfPaginated';host.appendChild(sheet);return sheet;};
+    let page=newPage();
+    const fits=()=>page.getBoundingClientRect().height<=MAX_SHEET_HEIGHT;
+    function append(block,depth=0){
+      const item=block.cloneNode(true);page.appendChild(item);
+      if(fits())return;
+      item.remove();
+      if(page.children.length){pages.push(page.innerHTML);page.remove();page=newPage();page.appendChild(item);if(fits())return;item.remove()}
+      if(depth<2){const parts=splitLargeBlock(block);if(parts.length>1||parts[0]!==block){for(const part of parts)append(part,depth+1);return}}
+      // Truly indivisible element: keep it whole; fit-on-page capture will scale it.
+      page.appendChild(item);
+      pages.push(page.innerHTML);page.remove();page=newPage();
+    }
+    for(const block of originalBlocks)append(block);
+    if(page.children.length)pages.push(page.innerHTML);
+    page.remove();measure.remove();
+    return pages;
+  }
+
+  buildTeamReportPdf = async function(team,period,onProgress){
+    ensurePdfLibraries();
+    const rs=adminResults.filter(r=>r.periodId===period.id&&r.team===team)
+      .sort((a,b)=>a.name.localeCompare(b.name,'ko'));
+    if(!rs.length)throw new Error(`${team}의 완료 결과가 없습니다.`);
+    const {jsPDF}=window.jspdf;
+    const pdf=new jsPDF({orientation:'p',unit:'mm',format:'a4',compress:true});
+    let written=0;
+    async function insert(html){
+      const pages=await buildPages(html);
+      for(let i=0;i<pages.length;i++){
+        const canvas=await reportPageCanvas(pages[i]);
+        // This insertion never crops a block at an arbitrary image pixel.
+        appendCanvasFitOnePage(pdf,canvas,written>0);
+        written++;
+        await new Promise(r=>setTimeout(r,0));
+      }
+    }
+    onProgress?.('팀 요약 페이지 구성 중');
+    await insert(teamSummaryReportHtml(team,period,rs));
+    for(let i=0;i<rs.length;i++){
+      onProgress?.(`개인 결과 ${i+1}/${rs.length} · ${rs[i].name}`);
+      await insert(teamLeaderIndividualReportHtml(rs[i]));
+    }
+    addPdfPageNumbers(pdf);
+    return {pdf,blob:pdf.output('blob'),count:rs.length};
+  };
+})();
+
+</script>
 </body></html>
